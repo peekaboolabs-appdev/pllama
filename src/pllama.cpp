@@ -61,9 +61,28 @@
 #include "ggml-backend.h"
 #include "llama.cpp/src/llama-sampling.h"
 
+// Global atomic for tracking model loading state
+static std::atomic<bool> model_loading_in_progress(false);
+
 // Forward declare logging functions
 static void log_message(const char *message, pllama_log_callback dart_logger = nullptr);
 static void log_message(const std::string &message, pllama_log_callback dart_logger = nullptr);
+
+// Memory utilities
+static void force_memory_release() {
+  // Attempt to free memory by forcing system calls
+#ifdef _WIN32
+  // Windows: call EmptyWorkingSet
+  EmptyWorkingSet(GetCurrentProcess());
+#else
+  // Linux/Mac: malloc trim if available
+#ifdef __GLIBC__
+  malloc_trim(0);
+#endif
+#endif
+  // Allow some time for memory to be released
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+}
 
 // Implement logging functions
 static void log_message(const char *message, pllama_log_callback dart_logger) {
@@ -105,6 +124,13 @@ static bool add_tokens_to_context(struct llama_context *ctx_llama,
     // Keep tokens data alive until we're done with the batch
     std::vector<llama_token> tokens_data = tokens;
     log_message("[DEBUG] about to call llama_batch_get_one", logger);
+    
+    // Safety check for nullptr
+    if (!ctx_llama) {
+        log_message("[ERROR] Context is null in add_tokens_to_context", logger);
+        return false;
+    }
+    
     llama_batch batch = llama_batch_get_one(tokens_data.data(), tokens_data.size());
     log_message("[DEBUG] got batch with " + std::to_string(batch.n_tokens) + " tokens", logger);
     
@@ -136,6 +162,12 @@ static bool add_token_to_context(struct llama_context *ctx_llama,
     log_message("[DEBUG] adding token " + std::to_string(id) + " to context", logger);
     log_message("[DEBUG] add_token_to_context start, token id: " + std::to_string(id), logger);
     
+    // Safety check for nullptr
+    if (!ctx_llama) {
+        log_message("[ERROR] Context is null in add_token_to_context", logger);
+        return false;
+    }
+    
     // Check context space first
     int n_ctx = llama_n_ctx(ctx_llama);
     int n_ctx_used = llama_get_kv_cache_used_cells(ctx_llama);
@@ -160,7 +192,6 @@ static bool add_token_to_context(struct llama_context *ctx_llama,
     }
     log_message("[DEBUG] decode successful", logger);
 
-    llama_batch_free(batch);
     *n_past = llama_get_kv_cache_used_cells(ctx_llama);
     log_message("[DEBUG] add_token_to_context complete, n_past: " + std::to_string(*n_past), logger);
     return true;
@@ -169,8 +200,19 @@ static bool add_token_to_context(struct llama_context *ctx_llama,
 static bool add_string_to_context(struct llama_context *ctx_llama,
                                   const char *str, int n_batch, int *n_past,
                                   bool add_bos, pllama_log_callback logger) {
+  // Safety check for null pointers
+  if (!ctx_llama || !str) {
+    log_message("[ERROR] Null pointer passed to add_string_to_context", logger);
+    return false;
+  }
+
   std::string str2 = str;
   const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_llama));
+  if (!vocab) {
+    log_message("[ERROR] Failed to get vocabulary from model", logger);
+    return false;
+  }
+
   const int n_prompt_tokens = -llama_tokenize(
       vocab, str2.c_str(), str2.length(), NULL, 0, add_bos, true);
   std::vector<llama_token> embd_inp(n_prompt_tokens);
@@ -187,45 +229,139 @@ static void log_callback_wrapper(enum ggml_log_level level, const char *text,
   std::cout << "[llama] " << text;
 }
 
-
+// Verifies model file header to ensure it's a valid GGUF file
+static bool verify_model_file(const char* path, bool detailed_check = false) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file.good()) {
+    std::cerr << "[pllama] Cannot open model file: " << path << std::endl;
+    return false;
+  }
+  
+  // Check file size
+  file.seekg(0, std::ios::end);
+  size_t size = file.tellg();
+  file.seekg(0, std::ios::beg);
+  
+  if (size < 32) { // Very small files can't be valid models
+    std::cerr << "[pllama] File too small to be a valid model: " << size << " bytes" << std::endl;
+    return false;
+  }
+  
+  // Check GGUF magic
+  char header[4];
+  file.read(header, 4);
+  bool valid_header = header[0] == 'G' && header[1] == 'G' && 
+                     header[2] == 'U' && header[3] == 'F';
+  
+  if (!valid_header) {
+    std::cerr << "[pllama] Invalid model file format (not a GGUF file)" << std::endl;
+    return false;
+  }
+  
+  // For detailed validation, we could check file version, tensor counts, etc.
+  if (detailed_check) {
+    // Read GGUF version
+    uint32_t version;
+    file.read(reinterpret_cast<char*>(&version), sizeof(version));
+    
+    // More detailed validation as needed
+    std::cout << "[pllama] GGUF version: " << version << std::endl;
+  }
+  
+  return true;
+}
 
 EMSCRIPTEN_KEEPALIVE void
 pllama_inference_sync(pllama_inference_request request,
                       pllama_inference_callback callback) {
+  // Prevent concurrent model loading
+  if (model_loading_in_progress.exchange(true)) {
+    // Another loading operation is already in progress
+    if (callback != NULL) {
+      callback("Error: Another model loading operation is already in progress", true);
+    }
+    model_loading_in_progress.store(false);
+    return;
+  }
+  
+  // Reset the flag when we exit this function
+  auto reset_loading_flag = [&]() {
+    model_loading_in_progress.store(false);
+  };
+  
   // Setup parameters, then load the model and create a context.
   int64_t start = ggml_time_ms();
   std::cout << "[pllama] Inference thread start" << std::endl;
+  
+  // Validate input parameters before proceeding
+  if (!request.model_path || !request.input) {
+    if (callback != NULL) {
+      callback("Error: Missing required input parameters (model_path and input are required)", true);
+    }
+    std::cerr << "[pllama] Missing required input parameters" << std::endl;
+    reset_loading_flag();
+    return;
+  }
+  
+  // Verify model file header
+  if (!verify_model_file(request.model_path)) {
+    if (callback != NULL) {
+      callback("Error: Invalid or inaccessible model file", true);
+    }
+    reset_loading_flag();
+    return;
+  }
+  
   try {
+    // Release memory before loading
+    force_memory_release();
+    
     ggml_backend_load_all();
     std::cout << "[pllama] Backend initialized." << std::endl;
 
+    // Create model parameters with optimized settings for better loading performance
+    llama_model_params model_params = llama_model_default_params();
+    
+    // Optimize for memory-constrained environments
+    model_params.n_gpu_layers = request.num_gpu_layers;
+    model_params.use_mmap = true;  // Use memory mapping for efficiency
+    model_params.use_mlock = false; // Don't lock memory
+    model_params.progress_callback = NULL; // No progress callback for cleaner loading
+    
+    // Optimize context parameters
     llama_context_params ctx_params = llama_context_default_params();
-    std::cout << "[pllama] Initializing params." << std::endl;
-    uint32_t requested_context_size = request.context_size;
-    ctx_params.n_ctx = requested_context_size;
+    ctx_params.n_ctx = request.context_size;
+    ctx_params.n_batch = request.context_size;
+    
+    // Enforce safe limits for mobile
+    #if defined(__ANDROID__) || (defined(__APPLE__) && (TARGET_OS_IOS || TARGET_IPHONE_SIMULATOR))
+      // Mobile device - force even more conservative settings
+      model_params.n_gpu_layers = 0; // CPU only on mobile
+      model_params.use_mmap = true;
+      
+      // Limit thread count on mobile
+      if (request.num_threads > 2) {
+        ctx_params.n_threads = 2;
+        if (request.dart_logger) {
+          request.dart_logger("[pllama] Mobile detected: limiting to 2 threads for stability");
+        }
+      } else {
+        ctx_params.n_threads = request.num_threads;
+      }
+    #else
+      // Desktop environment
+      ctx_params.n_threads = request.num_threads;
+    #endif
+    
+    // ctx_params.seed = LLAMA_DEFAULT_SEED; // 이 라인은 오류 발생으로 제거
+    ctx_params.flash_attn = false; // Disable flash attention for compatibility
+    
     std::cout << "[pllama] Context size: " << ctx_params.n_ctx << std::endl;
-    // >=32 needed for BLAS.
-    // # Why is n_batch = context size? 
-    // Post-Jan 2025 update, the llama.cpp inference imitates simple-chat.cpp, which
-    // adds the entire prompt in one call. There isn't a downside to this, in early 2024,
-    // there used to be an issue with memory headroom and context size on extremely constrained
-    // devices, but that's no longer the case.
-    //
-    // Now, if we try using a batch size < input token count, there will be an assertion failure. 
-    // In general, it seems batch_size = context_size is the best way because that guarantees as
-    // the batch updates after each inference run, there won't be any issues. (the idea there might
-    // be an issue assumes batch = input + all tokens generated thus far, which may not be the case)
-    uint32_t n_batch = requested_context_size;
-    ctx_params.n_batch = requested_context_size;
     std::cout << "[pllama] Batch size: " << ctx_params.n_batch << std::endl;
-    ctx_params.flash_attn = false;
-    std::cout << "[pllama] flash_attn: " << ctx_params.flash_attn << std::endl;
+    std::cout << "[pllama] Threads: " << ctx_params.n_threads << std::endl;
+    std::cout << "[pllama] GPU layers: " << model_params.n_gpu_layers << std::endl;
 
-    // TODO: params.n_predict = request.max_tokens;
-    // std::cout << "[pllama] Max tokens: " << params.n_predict << std::endl;
-    // TODO: params.n_threads = request.num_threads;
-    // std::cout << "[pllama] Number of threads: " << params.n_threads <<
-    // std::endl;
+    // Configure sampling
     llama_sampler *smpl =
         llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(
@@ -233,33 +369,9 @@ pllama_inference_sync(pllama_inference_request request,
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(request.temperature));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-    llama_model_params model_params = llama_model_default_params();
-    // std::vector<llama_sampler_type> samplers = {
-    //     llama_sampler_type::TOP_P, llama_sampler_type::TEMPERATURE};
-    // params.sparams.samplers_sequence = samplers;
-    // params.sparams.top_p = request.top_p;
-    // std::cout << "[pllama] Top_p: " << params.sparams.top_p << std::endl;
-    // TODO: request.grammar
-    // if (request.grammar != NULL && strlen(request.grammar) > 0) {
-    //   std::cout << "[pllama] Grammar: " << request.grammar << std::endl;
-    //   params.sparams.grammar = std::string(request.grammar);
-    // }
-    // std::cout << "[pllama] Model path: " << params.model << std::endl;
-// Force CPU if iOS simulator: no GPU support available, hangs.
-#if TARGET_IPHONE_SIMULATOR
-    model_params.n_gpu_layers = 0;
-// Otherwise, for physical iOS devices and other platforms
-#else
-    model_params.n_gpu_layers = request.num_gpu_layers;
-    // pllama_log("[pllama] Number of GPU layers requested: " +
-    //  std::to_string(params.n_gpu_layers),
-    //  request.dart_logger);
-    std::cout << "[pllama] Number of GPU layers requested: "
-              << model_params.n_gpu_layers << std::endl;
-#endif
-    // Check if a Dart logger function is provided, use it if available.
+    // Configure logging
     if (request.dart_logger != NULL) {
-      std::cout << "[pllama] Request log callback for llama.cpp detected";
+      std::cout << "[pllama] Using custom logger" << std::endl;
       llama_log_set(
           [](enum ggml_log_level level, const char *text, void *user_data) {
             pllama_log_callback dart_logger =
@@ -267,25 +379,11 @@ pllama_inference_sync(pllama_inference_request request,
             dart_logger(text);
           },
           reinterpret_cast<void *>(request.dart_logger));
-      std::cout << "[pllama] Request log callback installed for llama.cpp. ";
     } else {
-      std::cout
-          << "[pllama] pllama default log callback installed for llama.cpp. ";
       llama_log_set(log_callback_wrapper, NULL);
     }
-    // By default, llama.cpp emits a llama.log file containing ex. ~20 highest
-    // probability tokens and the tokens selected. This is interesting, but,
-    // there's privacy implications with that, as well as the log will grow
-    // unbounded according to an issue on the llama.cpp GitHub repo.
-    //
-    // This imitates the solution used in the llama.cpp server when
-    // --log-disable is passed.
-    //
-    // See https://github.com/ggerganov/llama.cpp/pull/4260.
-    // TODO: ???
-    // log_set_target(stdout);
-    log_message("Initialized llama logger.", request.dart_logger);
-    // !!! Specific to multimodal
+    
+    // Multimodal handling
     bool prompt_contains_img = prompt_contains_image(request.input);
     bool should_load_clip = false;
     if (prompt_contains_img) {
@@ -310,50 +408,111 @@ pllama_inference_sync(pllama_inference_request request,
     char *c_result = nullptr;
 
     auto cleanup = [&]() {
+      // Proper resource cleanup in order
+      if (ctx)
+        llama_free(ctx);
       if (model)
         llama_model_free(model);
       if (smpl)
         llama_sampler_free(smpl);
-      if (ctx)
-        llama_free(ctx);
       llama_backend_free();
-      free(c_result);
+      if (c_result) free(c_result);
+      reset_loading_flag();
     };
 
-    log_message("Initializing llama model...", request.dart_logger);
+    // Progressive model loading approach for better memory management
+    log_message("Starting progressive model loading...", request.dart_logger);
+    
+    // Step 1: Load vocabulary only first (much faster and lower memory)
+    std::cout << "[pllama] Phase 1: Loading model vocabulary..." << std::endl;
+    model_params.vocab_only = true;
     model = llama_model_load_from_file(request.model_path, model_params);
-    ctx = llama_new_context_with_model(model, ctx_params);
-    if (model == NULL || ctx == NULL) {
-      std::cout << "[pllama] Unable to load model." << std::endl;
-      if (model != NULL) {
-        llama_model_free(model);
+    
+    if (model == NULL) {
+      std::cout << "[pllama] Unable to load model vocabulary." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Unable to load model vocabulary", true);
       }
-      callback(/* response */ "Error: Unable to load model.", /* done */ true);
-      log_message("Error: Unable to load model.", request.dart_logger);
+      cleanup();
+      return;
+    }
+    
+    // Release memory again after vocabulary load
+    force_memory_release();
+    
+    // Step 2: Now load the full model
+    std::cout << "[pllama] Phase 2: Loading full model..." << std::endl;
+    llama_model_free(model);
+    model = nullptr;
+    
+    model_params.vocab_only = false;
+    
+    // More detailed progress logging for full model load
+    if (request.dart_logger) {
+      request.dart_logger("[pllama] Loading full model - this may take some time...");
+    }
+    
+    model = llama_model_load_from_file(request.model_path, model_params);
+    if (model == NULL) {
+      std::cout << "[pllama] Unable to load full model." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Unable to load full model", true);
+      }
       cleanup();
       return;
     }
 
-    log_message("Initialized model.", request.dart_logger);
+    log_message("Model loaded successfully", request.dart_logger);
+    
+    // Create context with the loaded model
+    ctx = llama_init_from_model(model, ctx_params);
+    if (ctx == NULL) {
+      std::cout << "[pllama] Unable to create context." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Unable to create context", true);
+      }
+      cleanup();
+      return;
+    }
 
     std::string final_request_input = request.input;
-    // TODO: CLIP support
+    
+    // Handle multimodal/image content if present
     if (should_load_clip) {
       std::string mmproj_path_std_str =
           request.model_mmproj_path == NULL ? "" : request.model_mmproj_path;
       log_message("Loading multimodal model...", request.dart_logger);
       const char *mmproj_path = mmproj_path_std_str.c_str();
+      
+      // Validate CLIP model path
+      std::ifstream clip_file_check(mmproj_path);
+      if (!clip_file_check.good()) {
+        std::cout << "[pllama] Unable to load CLIP model." << std::endl;
+        if (callback != NULL) {
+          callback("Error: Unable to load CLIP model", true);
+        }
+        cleanup();
+        return;
+      }
+      clip_file_check.close();
+      
       auto ctx_clip = clip_model_load(mmproj_path, /*verbosity=*/1);
-      std::cout << "Loaded model" << std::endl;
+      if (!ctx_clip) {
+        std::cout << "[pllama] Failed to load CLIP model." << std::endl;
+        if (callback != NULL) {
+          callback("Error: Failed to load CLIP model", true);
+        }
+        cleanup();
+        return;
+      }
+      
+      std::cout << "Loaded CLIP model successfully" << std::endl;
       image_embeddings = llava_image_embed_make_with_prompt_base64(
-          ctx_clip, 1 /* or params.n_threads */, final_request_input);
+          ctx_clip, ctx_params.n_threads, final_request_input);
       clip_free(ctx_clip);
     }
 
-    // It is important that this runs regardless of whether CLIP needs to be
-    // loaded. For example, for an errorneus request that doesn't provide the
-    // CLIP model path. Otherwise, inference has to tokenize the base64 image
-    // string, which is not a good idea. (O(100,000K) tokens)
+    // Process and clean up prompt if it contains images
     if (prompt_contains_img) {
       if (image_embeddings.empty()) {
         std::cout
@@ -370,37 +529,69 @@ pllama_inference_sync(pllama_inference_request request,
 
     int64_t model_load_end = ggml_time_ms();
     int64_t model_load_duration_ms = model_load_end - start;
-    log_message("Model loaded @ " + std::to_string(model_load_duration_ms) +
+    log_message("Model loaded in " + std::to_string(model_load_duration_ms) +
                    " ms.",
                request.dart_logger);
 
     // Tokenize the prompt
     const int n_ctx = llama_n_ctx(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    
+    if (!vocab) {
+      std::cout << "[pllama] Failed to get vocabulary." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Failed to get vocabulary", true);
+      }
+      cleanup();
+      return;
+    }
 
     const int n_prompt_tokens =
         -llama_tokenize(vocab, final_request_input.c_str(),
                         final_request_input.length(), NULL, 0, true, true);
+    
+    if (n_prompt_tokens <= 0) {
+      std::cout << "[pllama] Tokenization failed." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Tokenization failed", true);
+      }
+      cleanup();
+      return;
+    }
+    
     std::vector<llama_token> tokens_list(n_prompt_tokens);
     if (llama_tokenize(vocab, final_request_input.c_str(),
                        final_request_input.length(), tokens_list.data(),
                        tokens_list.size(), true, true) < 0) {
       fprintf(stderr, "%s: tokenization failed\n", __func__);
-      callback("Error: Unable to tokenize input", true);
+      if (callback != NULL) {
+        callback("Error: Unable to tokenize input", true);
+      }
       cleanup();
       return;
     }
+    
     log_message("Input token count: " + std::to_string(tokens_list.size()),
                request.dart_logger);
     log_message("Output token count: " + std::to_string(request.max_tokens),
                request.dart_logger);
+    
     const int n_max_tokens = request.max_tokens;
-    log_message("Number of threads: " + std::to_string(ctx_params.n_threads),
-               request.dart_logger);
+    const int n_batch = ctx_params.n_batch;
+    
+    // Validate context capacity
+    if (tokens_list.size() > static_cast<size_t>(n_ctx - n_max_tokens)) {
+      std::cout << "[pllama] Input too large for context size." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Input too large for context size", true);
+      }
+      cleanup();
+      return;
+    }
 
-    // 2. Load the prompt into the context.
+    // Process images embeddings first if they exist
     int n_past = 0;
-    bool add_bos = llama_add_bos_token(vocab);
+    bool add_bos = llama_vocab_get_add_bos(vocab);
     int idx_embedding = 0;
     for (auto *embedding : image_embeddings) {
       if (embedding != NULL) {
@@ -429,116 +620,115 @@ pllama_inference_sync(pllama_inference_request request,
       }
     }
 
-    // // DEBUG: Print the input line by line, numbered:
-    // std::istringstream iss(final_request_input);
-    // std::string line;
-    // int line_number = 1;
-
-    // while (std::getline(iss, line)) {
-    //   pllama_log("Line " + std::to_string(line_number) + ": " + line,
-    //              request.dart_logger);
-    //   line_number++;
-    // }
-
-    log_message("Adding input to context...length: " +
-                   std::to_string(final_request_input.length()),
-               request.dart_logger);
-    log_message("Context size: " + std::to_string(n_ctx), request.dart_logger);
-    log_message("Input tokens: " + std::to_string(tokens_list.size()),
-               request.dart_logger);
-    add_tokens_to_context(ctx, tokens_list, n_batch, &n_past, request.dart_logger);
-    log_message("Added input to context.", request.dart_logger);
+    log_message("Adding input to context...", request.dart_logger);
     
-    log_message("Initializing sampling context...", request.dart_logger);
-    // Using smpl instead of ctx_sampling
-    log_message("Sampling context initialized.", request.dart_logger);
+    // Add text tokens to context
+    if (!add_tokens_to_context(ctx, tokens_list, n_batch, &n_past, request.dart_logger)) {
+      std::cout << "[pllama] Failed to add tokens to context." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Failed to add tokens to context", true);
+      }
+      cleanup();
+      return;
+    }
+    
+    log_message("Input added to context successfully", request.dart_logger);
+    
+    // Get EOS token for generation
     const char *eos_token_chars =
         request.eos_token != NULL ? request.eos_token
                                   : pllama_get_eos_token(request.model_path);
+    
+    // Check if EOS token retrieval failed
+    if (!eos_token_chars) {
+      std::cout << "[pllama] Failed to get EOS token." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Failed to get EOS token", true);
+      }
+      cleanup();
+      return;
+    }
+    
     const std::string eos_token_as_string = std::string(eos_token_chars);
     free((void *)eos_token_chars);
+    
     const int64_t context_setup_complete = ggml_time_ms();
-    log_message("Context setup complete & input added to context. Took " +
+    log_message("Context setup complete in " +
                    std::to_string(context_setup_complete - start) + " ms.",
                request.dart_logger);
 
-    // 3. Generate tokens.
-    // Check for cancellation before starting the generation loop
+    // Check for cancellation before starting generation
     int request_id = request.request_id;
-
     if (global_inference_queue.is_cancelled(request_id)) {
-      log_message("Cancelled before starting generation loop. ID:" +
-                     std::to_string(request_id),
+      log_message("Request cancelled before generation started",
                  request.dart_logger);
-      callback("", true);
+      if (callback != NULL) {
+        callback("", true);
+      }
       cleanup();
       return;
     }
 
-    // Issue empty callback with done = false. This is to provide a signal
-    // that inference is about to start, with the intention of giving clients 
-    // a way to detect if the previous inference crashed. 
-    // 
-    // That has to be done here, instead of client-side, because the client
-    // cannot differentiate between a request being queued and immediately executed.
-    // 
-    // With this, it can flip a "isRunning" flag to true, persist it, and then
-    // if it later tries running inference when the flag is true, it can assume
-    // the previous inference crashed.
-    //
-    // The root cause here is model files come in a variety of shapes and sizes,
-    // For example, there were q4_0_0 models in H2 2024 that had significantly faster
-    // inference on ARM. However, running those same models on macOS ARM would crash
-    // due to an assertion failure deep in ggml.cpp. 
-    // - try / catch in C++ still led to the assertion
-    // - signal handlers are fraught and did not work anyway
-    // - being in a separate executable/process is not an option on at least iOS.
-    callback("", false);
+    // Signal that we're starting the generation phase
+    if (callback != NULL) {
+      callback("", false);
+    }
     
+    // Allocate result buffer with safety checks
     const auto estimated_total_size = n_max_tokens * 10;
     std::string result;
     result.reserve(estimated_total_size);
-    c_result = (char *)malloc(
-        estimated_total_size); // Allocate once with estimated size
+    c_result = (char *)malloc(estimated_total_size);
+    if (!c_result) {
+      std::cout << "[pllama] Failed to allocate memory for result." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Memory allocation failure", true);
+      }
+      cleanup();
+      return;
+    }
+    c_result[0] = '\0'; // Initialize to empty string
 
-    // TODO: re-implement sampling print
-    // TODO: re-implement sampling order print
-
+    // Generation loop with improved error handling and stability
+    log_message("[DEBUG] starting token generation loop", request.dart_logger);
+    
+    // Safely sample first token
+    if (!ctx) {
+      std::cout << "[pllama] Context is null before token generation." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Context is null", true);
+      }
+      cleanup();
+      return;
+    }
+    
+    // Start token generation
+    llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
+    if (new_token_id == -1) {
+      std::cout << "[pllama] Failed to sample first token." << std::endl;
+      if (callback != NULL) {
+        callback("Error: Token sampling failed", true);
+      }
+      cleanup();
+      return;
+    }
+    
     int n_gen = 0;
-    std::string buffer; // Buffer to accumulate potential EOS token sequences
-
-    const auto model_eos_token = llama_token_eos(vocab);
+    const auto model_eos_token = llama_vocab_eos(vocab);
     const int64_t start_t = ggml_time_ms();
     int64_t t_last = start_t;
-
+    
     std::vector<std::string> eos_tokens = {
         eos_token_as_string, // The original EOS token
         "<|end|>",           // Phi 3 24-04-30
         "<|eot_id|>"         // Llama 3 24-04-30
     };
-    /**
-     * Token Generation Loop
-     * 
-     * Each iteration follows this sequence:
-     * 1. Decode current batch (updates KV cache/model state)
-     * 2. Sample next token (using updated state)
-     * 3. Convert token to text & add to output
-     * 4. Create new batch with sampled token (for next iteration)
-     * 
-     * Batches represent "what needs to be processed to update the state
-     * before we can sample the next token". The model's state is maintained
-     * in its KV cache, which gets updated when we decode each batch.
-     * 
-     * Example flow:
-     * Initial state -> [decode nothing] -> sample "The" ->
-     * [decode "The"] -> sample "cat" ->
-     * [decode "cat"] -> sample "sat" -> ...
-     */
-    log_message("[DEBUG] starting token generation loop", request.dart_logger);
-    llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
-    llama_batch batch = llama_batch_get_one(&new_token_id, 1);
     
-    while (true) {
+    // Main token generation loop with batch processing
+    llama_batch batch = llama_batch_get_one(&new_token_id, 1);
+    bool generation_complete = false;
+    
+    while (!generation_complete) {
         // Check context space
         int n_ctx = llama_n_ctx(ctx);
         int n_ctx_used = llama_get_kv_cache_used_cells(ctx);
@@ -547,141 +737,126 @@ pllama_inference_sync(pllama_inference_request request,
             break;
         }
     
-        // Convert current token to text and output it
-        char token_text[256];
-        int token_len = llama_token_to_piece(vocab, new_token_id, token_text, sizeof(token_text), 0, true);
+        // Convert current token to text
+        char token_text[256] = {0}; // Initialize to zeros for safety
+        int token_len = llama_token_to_piece(vocab, new_token_id, token_text, sizeof(token_text) - 1, 0, true);
         if (token_len < 0) {
             log_message("[DEBUG] failed to convert token to text", request.dart_logger);
             break;
         }
         
-        // Add to result and send partial update
-        std::string piece(token_text, token_len);
+        // Ensure null termination
+        token_text[token_len < 255 ? token_len : 255] = '\0';
+        
+        // Add to result and send update
+        std::string piece(token_text);
         result += piece;
         n_gen++;
+        
+        // Send intermediate result to callback
         if (callback != NULL) {
-            std::strcpy(c_result, result.c_str());
-            callback(c_result, false);
+            if (result.length() < estimated_total_size) {
+                std::strncpy(c_result, result.c_str(), estimated_total_size - 1);
+                c_result[estimated_total_size - 1] = '\0'; // Ensure null termination
+                callback(c_result, false);
+            } else {
+                log_message("[WARNING] Result exceeded estimated size", request.dart_logger);
+            }
         }
     
-        // Process current batch
+        // Process the batch
         if (llama_decode(ctx, batch)) {
             log_message("[DEBUG] decode failed", request.dart_logger);
             break;
         }
+        
         // Sample next token
         new_token_id = llama_sampler_sample(smpl, ctx, -1);
     
-        // Check for end conditions
-        if (llama_token_is_eog(vocab, new_token_id)) {
+        // Check end conditions
+        if (new_token_id == model_eos_token || llama_vocab_is_eog(vocab, new_token_id)) {
             log_message("[DEBUG] end of generation detected", request.dart_logger);
+            generation_complete = true;
             break;
         }
+        
         if (n_gen >= n_max_tokens) {
             log_message("[DEBUG] reached max tokens: " + std::to_string(n_max_tokens), request.dart_logger);
+            generation_complete = true;
             break;
         }
+        
         if (global_inference_queue.is_cancelled(request_id)) {
             log_message("[DEBUG] generation cancelled", request.dart_logger);
+            generation_complete = true;
             break;
         }
     
-        // Create new batch for next iteration
+        // Prepare next batch
         batch = llama_batch_get_one(&new_token_id, 1);
-      // auto add_to_context_end = std::chrono::high_resolution_clock::now();
-      // std::chrono::duration<double, std::milli> add_to_context_duration =
-      //     add_to_context_end - add_to_context_start;
-      // pllama_log("Add to context took " +
-      // std::to_string(add_to_context_duration.count()) +
-      //                " milliseconds.",
-      //            request.dart_logger);
-
-      // If greater than a second has passed since last log, log
-      // the speed of generation.
-      const auto t_now = ggml_time_ms();
-      if (t_now - t_last > 1000) {
-        fprintf(stderr,
-                "[pllama] generated %d tokens in %.2f s, speed: %.2f t/s\n",
-                n_gen, (t_now - start_t) / 1000.0,
-                n_gen / ((t_now - start_t) / 1000.0));
-        t_last = t_now;
-      }
-
-      // Check for EOS on model tokens
-      if (llama_token_is_eog(vocab, new_token_id)) {
-        fprintf(stderr, "%s: Finish. Model EOS token found.", __func__);
-        if (buffer.length() > 0) {
-          result += buffer;
+        
+        // Log generation speed periodically
+        const auto t_now = ggml_time_ms();
+        if (t_now - t_last > 1000) {
+            float speed = n_gen / ((t_now - start_t) / 1000.0f);
+            log_message("[pllama] generated " + std::to_string(n_gen) + 
+                      " tokens at " + std::to_string(speed) + " tokens/sec",
+                      request.dart_logger);
+            t_last = t_now;
         }
-        break;
-      }
-      // auto other_end = std::chrono::high_resolution_clock::now();
-      // std::chrono::duration<double, std::milli> other_duration =
-      //     other_end - sample_end;
-      // pllama_log("Other took " + std::to_string(other_duration.count()) +
-      //                " milliseconds.",
-      //            request.dart_logger);
     }
+    
     log_message("[DEBUG] token generation loop complete", request.dart_logger);
-    // If EOS token is found, above loop does not add it to buffer, and the
-    // loop stops immediately.
-    //
-    // That leaves the last tokens whos length sum < EOS token length in buffer.
-    //
-    // Add it to result.
-    //
-    // Oddly, this issue was only readily apparent when doing function
-    // calling with models < 7B.
-    // if (buffer.length() > 0) {
-    //   result += buffer;
-    // }
-
-    // Can't free this: the threading behavior is such that the Dart function
-    // will get the pointer at some point in the future. Infrequently, 1 / 20
-    // times, this will be _after_ this function returns. In that case, the
-    // final output is a bunch of null characters: they look like 6 vertical
-    // lines stacked.
-
-    std::strcpy(c_result, result.c_str());
-    if (callback != NULL) {
-      log_message("[DEBUG] Invoking final callback", request.dart_logger);
-      callback(/* response */ c_result, /* done */ true);
-      log_message("[DEBUG] Final callback invoked", request.dart_logger);
+    
+    // Send final result
+    if (result.length() < estimated_total_size) {
+        std::strncpy(c_result, result.c_str(), estimated_total_size - 1);
+        c_result[estimated_total_size - 1] = '\0'; // Ensure null termination
     } else {
-      log_message("WARNING: callback is NULL. Output: " + result,
-                 request.dart_logger);
+        log_message("[WARNING] Result exceeded estimated size", request.dart_logger);
+        std::strncpy(c_result, result.c_str(), estimated_total_size - 1);
+        c_result[estimated_total_size - 1] = '\0'; // Ensure null termination
+    }
+    
+    if (callback != NULL) {
+        log_message("[DEBUG] Invoking final callback", request.dart_logger);
+        callback(c_result, true);
+        log_message("[DEBUG] Final callback invoked", request.dart_logger);
+    } else {
+        log_message("WARNING: callback is NULL. Output: " + result,
+                   request.dart_logger);
     }
 
-    log_message("About to write speed of generation", request.dart_logger);
-
+    // Log final performance statistics
     const auto t_now = ggml_time_ms();
-
+    const auto total_time_ms = t_now - start_t;
+    const auto speed_tokens_per_sec = n_gen / (total_time_ms / 1000.0f);
+    
     const auto speed_string =
         "Generated " + std::to_string(n_gen) + " tokens in " +
-        std::to_string((t_now - start_t) / 1000.0) + " s, speed: " +
-        std::to_string(n_gen / ((t_now - start_t) / 1000.0)) + " t/s.";
+        std::to_string(total_time_ms / 1000.0f) + " seconds, speed: " +
+        std::to_string(speed_tokens_per_sec) + " tokens/sec";
 
     log_message(speed_string, request.dart_logger);
-
-    log_message("Wrote speed of generation.", request.dart_logger);
-    // Free everything. Model loading time is negligible, especially when
-    // compared to amount of RAM consumed by leaving model in memory
-    // (~= size of model on disk)
-    log_message("Freeing resources...", request.dart_logger);
+    
+    // Clean up resources
+    log_message("Cleaning up resources...", request.dart_logger);
     cleanup();
-    log_message("Freed resources.", request.dart_logger);
+    log_message("Resources cleaned up successfully", request.dart_logger);
   } catch (const std::exception &e) {
     std::string error_msg = "Unhandled error: " + std::string(e.what());
     if (callback != NULL) {
       callback(error_msg.c_str(), true);
     }
     std::cerr << error_msg << std::endl;
+    model_loading_in_progress.store(false);
   } catch (...) {
     std::string error_msg = "Unknown unhandled error occurred";
     if (callback != NULL) {
       callback(error_msg.c_str(), true);
     }
     std::cerr << error_msg << std::endl;
+    model_loading_in_progress.store(false);
   }
 }
 

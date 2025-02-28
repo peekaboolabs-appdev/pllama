@@ -47,6 +47,8 @@ add_library(pllama SHARED
   "llava.cpp"
 )
 
+target_compile_options(pllama PRIVATE "-Wcast-align")
+
 set_target_properties(pllama PROPERTIES
   PUBLIC_HEADER "pllama.h;pllama_eos.h;pllama_tokenize.h"
   OUTPUT_NAME "pllama"

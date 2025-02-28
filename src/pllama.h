@@ -19,6 +19,8 @@
 extern "C" {
 #endif
 
+// pllama.h 파일 수정
+// pllama.h에서 콜백 시그니처 수정
 typedef void (*pllama_inference_callback)(const char *response, uint8_t done);
 typedef void (*pllama_log_callback)(const char *);
 

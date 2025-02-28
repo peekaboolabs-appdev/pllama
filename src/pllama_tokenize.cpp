@@ -1,150 +1,272 @@
 #include "pllama_tokenize.h"
 
+// Add these headers at the top
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <vector>
+#include <sstream>
 #include <unordered_map>
+#include <fstream>
+#include <chrono>
+#include <atomic>
+#include <shared_mutex>  // Remove this if not supported
 
-#if TARGET_OS_IOS
-// iOS-specific includes
-#include "../ios/llama.cpp/common/base64.hpp"
-#include "../ios/llama.cpp/common/common.h"
-#include "../ios/llama.cpp/common/sampling.h"
-#include "../ios/llama.cpp/ggml/include/ggml.h"
-#include "../ios/llama.cpp/include/llama.h"
-#elif TARGET_OS_OSX
-// macOS-specific includes
-#include "../macos/llama.cpp/common/base64.hpp"
-#include "../macos/llama.cpp/common/common.h"
-#include "../macos/llama.cpp/common/sampling.h"
-#include "../macos/llama.cpp/ggml/include/ggml.h"
-#include "../macos/llama.cpp/include/llama.h"
-#else
-// Other platforms
-#include "llama.cpp/common/base64.hpp"
-#include "llama.cpp/common/common.h"
-#include "ggml.h"
 #include "llama.h"
-#endif
+#include "ggml.h"
 
-// Tokenizer model caching predeclarations
-std::shared_ptr<llama_model> _get_or_load_model(const std::string &model_path);
-// End tokenizer model caching predeclarations
+// Modify the logging macro to use a more compatible approach
+#define PLLAMA_LOG(level, message) \
+    do { \
+        std::cerr << "[pllama-tokenize:" << level << "] " << message << std::endl; \
+    } while(0)
 
-EMSCRIPTEN_KEEPALIVE FFI_PLUGIN_EXPORT extern "C" 
-size_t pllama_tokenize(struct pllama_tokenize_request request) {
-/* DISABLED: Model load logs.
-  auto start_time_model_load = std::chrono::high_resolution_clock::now();
-*/
-  llama_log_set(
-      [](enum ggml_log_level level, const char *text, void *user_data) {
-        // do nothing. intent is to avoid ~50 lines of log spam with model
-        // config when tokenizing
-      },
-      NULL);
-  // Model caching avoids O(100 ms) cost for every tokenize request.
-  llama_model *model = _get_or_load_model(request.model_path).get();
-  if (!model) {
-    std::cout << "[pllama] Unable to load model." << std::endl;
-    return -1;
-  }
+class TokenizerManager {
+  public:
+      enum class LogLevel { DEBUG, INFO, WARNING, ERROR };
   
-  // 50 ms for initial load of 2 GB model, ~^10^-5 for cache hit.
-/* DISABLED: Model load logs.
-  auto end_time_model_load = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double, std::milli> model_load_duration =
-      end_time_model_load - start_time_model_load;
-  std::cout << "[pllama] Model loading took: " << model_load_duration.count() << " ms." << std::endl;
-*/
+      // Public logging method
+      static void log(LogLevel level, const std::string& message) {
+          switch(level) {
+              case LogLevel::ERROR:
+                  PLLAMA_LOG("ERROR", message);
+                  break;
+              case LogLevel::WARNING:
+                  PLLAMA_LOG("WARNING", message);
+                  break;
+              case LogLevel::INFO:
+                  PLLAMA_LOG("INFO", message);
+                  break;
+              case LogLevel::DEBUG:
+                  PLLAMA_LOG("DEBUG", message);
+                  break;
+          }
+      }
+  
+      // Singleton instance retrieval
+      static TokenizerManager& getInstance() {
+          static TokenizerManager instance;
+          return instance;
+      }
+  
+      // Improved model caching with more compatible locking
+      std::shared_ptr<llama_model> getOrLoadModel(const std::string& model_path) {
+          // Use standard mutex instead of shared_mutex
+          std::unique_lock<std::mutex> lock(cache_mutex);
+          auto now = std::chrono::steady_clock::now();
+  
+          // Check cache hit and validate entry
+          auto it = model_cache.find(model_path);
+          if (it != model_cache.end()) {
+              auto& entry = it->second;
+              if (isModelCacheValid(entry, now)) {
+                  entry.last_access = now;
+                  return entry.model;
+              }
+          }
+  
+          // Load model with cache
+          return loadModelWithCache(model_path, now);
+      }
+  
+  private:
+      struct ModelCacheEntry {
+          std::shared_ptr<llama_model> model;
+          std::chrono::steady_clock::time_point last_access;
+          std::chrono::steady_clock::time_point created_at;
+      };
+  
+      std::unordered_map<std::string, ModelCacheEntry> model_cache;
+      std::mutex cache_mutex;
+      std::atomic<size_t> total_cached_models{0};
+      static constexpr size_t MAX_CACHED_MODELS = 5;
+      static constexpr auto MODEL_CACHE_DURATION = std::chrono::minutes(30);
+  
+      bool isModelCacheValid(const ModelCacheEntry& entry, 
+                              const std::chrono::steady_clock::time_point& now) {
+          auto age = std::chrono::duration_cast<std::chrono::minutes>(
+              now - entry.created_at);
+          return age < MODEL_CACHE_DURATION;
+      }
+  
+      std::shared_ptr<llama_model> loadModelWithCache(
+          const std::string& model_path, 
+          const std::chrono::steady_clock::time_point& now) {
+          
+          // Validate model file
+          std::ifstream model_file(model_path, std::ios::binary);
+          if (!model_file.good()) {
+              log(LogLevel::ERROR, "Invalid model file: " + model_path);
+              return nullptr;
+          }
+  
+          // Prepare model loading parameters
+          llama_model_params mparams = llama_model_default_params();
+          mparams.vocab_only = true;
+          mparams.use_mmap = true;
+          mparams.n_gpu_layers = 0;
+  
+          // Suppress extensive logging
+          llama_log_set(
+              [](enum ggml_log_level level, const char* text, void*) {
+                  if (level >= GGML_LOG_LEVEL_ERROR) {
+                      std::cerr << "[llama-internal] " << text;
+                  }
+              }, 
+              nullptr
+          );
+  
+          // Initialize backend
+          llama_backend_init();
+  
+          // Load model
+          llama_model* raw_model = llama_model_load_from_file(model_path.c_str(), mparams);
+          
+          if (!raw_model) {
+              log(LogLevel::ERROR, "Failed to load model: " + model_path);
+              llama_backend_free();
+              return nullptr;
+          }
+  
+          // Create shared_ptr with custom deleter
+          auto model = std::shared_ptr<llama_model>(
+              raw_model, 
+              [](llama_model* ptr) { 
+                  llama_model_free(ptr); 
+              }
+          );
+  
+          // Manage cache size
+          if (total_cached_models >= MAX_CACHED_MODELS) {
+              evictOldestModel();
+          }
+  
+          // Insert into cache
+          model_cache[model_path] = {
+              model, 
+              now,  // last access 
+              now   // created at
+          };
+          total_cached_models++;
+  
+          llama_backend_free();
+          return model;
+      }
+  
+      void evictOldestModel() {
+          auto oldest_it = std::min_element(
+              model_cache.begin(), model_cache.end(),
+              [](const auto& a, const auto& b) {
+                  return a.second.last_access < b.second.last_access;
+              }
+          );
+  
+          if (oldest_it != model_cache.end()) {
+              model_cache.erase(oldest_it);
+              total_cached_models--;
+          }
+      }
+  };
 
-/* DISABLED: Tokenization logs.
-  auto start_time_tokenize = std::chrono::high_resolution_clock::now();
-*/
-  std::vector<llama_token> tokens_list;
-  const size_t input_len = strlen(request.input);
-  tokens_list.resize(input_len + 3);  // add extra space for special tokens
-  const llama_vocab * vocab = llama_model_get_vocab(model);
-  const int n_tokens = ::llama_tokenize(vocab,
-                                     request.input,
-                                     input_len,
-                                     tokens_list.data(), 
-                                     tokens_list.size(),
-                                     true,   // add BOS
-                                     true);  // parse special tokens
-  if (n_tokens < 0) {
-      return 0;  // Error case
-  }
-  tokens_list.resize(n_tokens);
-/* DISABLED: Tokenization logs.
-  auto end_time_tokenize = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double, std::milli> tokenize_duration =
-       end_time_tokenize - start_time_tokenize;
-   std::cout << "[pllama] Tokenization took: " << tokenize_duration.count()
-             << " ms. Input token count: " << tokens_list.size() << std::endl;
-*/
-  return tokens_list.size();
-}
+extern "C" {
+EMSCRIPTEN_KEEPALIVE FFI_PLUGIN_EXPORT 
+size_t pllama_tokenize(struct pllama_tokenize_request request) {
+    auto& manager = TokenizerManager::getInstance();
 
-struct ModelCacheEntry {
-  std::shared_ptr<llama_model> model;
-  std::chrono::steady_clock::time_point last_access;
-};
-
-std::mutex cache_mutex;
-std::unordered_map<std::string, ModelCacheEntry> model_cache;
-
-void cleanup_cache() {
-  auto now = std::chrono::steady_clock::now();
-  std::vector<std::string> to_erase;
-
-  for (const auto &entry : model_cache) {
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        now - entry.second.last_access);
-    if (elapsed.count() > 30) {
-      to_erase.push_back(entry.first);
+    // Validate input
+    if (!request.input || !request.model_path) {
+        manager.log(TokenizerManager::LogLevel::ERROR, 
+                    "Invalid tokenization request: missing input or model path");
+        return 0;
     }
-  }
 
-  for (const auto &key : to_erase) {
-    model_cache.erase(key);
-  }
-}
+    try {
+        // Get or load model
+        auto model = manager.getOrLoadModel(request.model_path);
+        if (!model) {
+            manager.log(TokenizerManager::LogLevel::ERROR, 
+                        "Failed to load model for tokenization");
+            return 0;
+        }
 
-std::shared_ptr<llama_model> _get_or_load_model(const std::string &model_path) {
-  std::lock_guard<std::mutex> lock(cache_mutex);
-  cleanup_cache();
+        // Get vocabulary
+        const llama_vocab* vocab = llama_model_get_vocab(model.get());
+        if (!vocab) {
+            manager.log(TokenizerManager::LogLevel::ERROR, 
+                        "Failed to retrieve vocabulary from model");
+            return 0;
+        }
 
-  auto iter = model_cache.find(model_path);
-  if (iter != model_cache.end()) {
-    iter->second.last_access = std::chrono::steady_clock::now();
-    return iter->second.model;
-  } else {
-    // Initialize model params with defaults
-    llama_model_params mparams = llama_model_default_params();
-    mparams.vocab_only = true;
-    mparams.use_mmap = true;
-    mparams.n_gpu_layers = 0;
-    llama_backend_init();
-    // Using llama_load_model_from_file instead of llama_init_from_gpt_params
-    // avoided a crash when tokenization was called in quick succession without
-    // this caching mechanism in place.
-    //
-    // It seems wise to continue using llama_load_model_from_file for tokenization,
-    // as after viewing the call chain, the resource allocation load is lower.
-    llama_model *raw_model =
-        llama_load_model_from_file(model_path.c_str(), mparams);
+        // Validate input length
+        const size_t input_len = strlen(request.input);
+        if (input_len == 0) {
+            manager.log(TokenizerManager::LogLevel::INFO, 
+                        "Empty input provided for tokenization");
+            return 0;
+        }
 
-    if (raw_model == nullptr) {
-      return nullptr;
+        // Allocate token buffer with safe sizing
+        const size_t max_possible_tokens = input_len * 2 + 16;
+        std::vector<llama_token> tokens(max_possible_tokens);
+
+        // First pass: determine required token count
+        const int token_count_needed = -llama_tokenize(
+            vocab, 
+            request.input, 
+            input_len, 
+            nullptr, 
+            0, 
+            llama_vocab_get_add_bos(vocab), 
+            true
+        );
+
+        if (token_count_needed <= 0) {
+            manager.log(TokenizerManager::LogLevel::WARNING, 
+                        "Tokenization count determination failed");
+            return 0;
+        }
+
+        // Resize buffer if needed
+        if (static_cast<size_t>(token_count_needed) > tokens.size()) {
+            tokens.resize(token_count_needed + 8);
+        }
+
+        // Perform actual tokenization
+        const int n_tokens = llama_tokenize(
+            vocab, 
+            request.input, 
+            input_len, 
+            tokens.data(), 
+            tokens.size(), 
+            llama_vocab_get_add_bos(vocab), 
+            true
+        );
+
+        if (n_tokens < 0) {
+            manager.log(TokenizerManager::LogLevel::ERROR, 
+                        "Tokenization failed with error code: " + 
+                        std::to_string(n_tokens));
+            return 0;
+        }
+
+        // Log successful tokenization
+        manager.log(TokenizerManager::LogLevel::INFO, 
+                    "Successful tokenization: " + 
+                    std::to_string(n_tokens) + " tokens");
+
+        return n_tokens;
     }
-
-    // Create a shared_ptr with custom deleter
-    std::shared_ptr<llama_model> model(
-        raw_model, [](llama_model *ptr) { llama_free_model(ptr); });
-
-    model_cache[model_path] = {model, std::chrono::steady_clock::now()};
-    llama_backend_free();
-    return model;
-  }
+    catch (const std::exception& e) {
+        manager.log(TokenizerManager::LogLevel::ERROR, 
+                    "Unexpected error during tokenization: " + 
+                    std::string(e.what()));
+        return 0;
+    }
+    catch (...) {
+        manager.log(TokenizerManager::LogLevel::ERROR, 
+                    "Unknown critical error during tokenization");
+        return 0;
+    }
 }
+} // extern "C"
